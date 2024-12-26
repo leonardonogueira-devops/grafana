@@ -16,14 +16,25 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/exp/slices"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8sUser "k8s.io/apiserver/pkg/authentication/user"
+	k8sRequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	"github.com/grafana/grafana/pkg/apis/folder/v0alpha1"
 	"github.com/grafana/grafana/pkg/bus"
 	"github.com/grafana/grafana/pkg/events"
 	"github.com/grafana/grafana/pkg/infra/db"
+	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/infra/metrics"
 	"github.com/grafana/grafana/pkg/infra/tracing"
+	internalfolders "github.com/grafana/grafana/pkg/registry/apis/folders"
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
+	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
 	"github.com/grafana/grafana/pkg/services/dashboards"
 	"github.com/grafana/grafana/pkg/services/dashboards/dashboardaccess"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
@@ -34,6 +45,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/store/entity"
 	"github.com/grafana/grafana/pkg/services/supportbundles"
 	"github.com/grafana/grafana/pkg/services/user"
+	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/util"
 )
 
@@ -47,6 +59,7 @@ type Service struct {
 	dashboardFolderStore folder.FolderStore
 	features             featuremgmt.FeatureToggles
 	accessControl        accesscontrol.AccessControl
+	k8sclient            folderK8sHandler
 	// bus is currently used to publish event in case of folder full path change.
 	// For example when a folder is moved to another folder or when a folder is renamed.
 	bus bus.Bus
@@ -55,6 +68,20 @@ type Service struct {
 	registry map[string]folder.RegistryService
 	metrics  *foldersMetrics
 	tracer   tracing.Tracer
+}
+
+// interface to allow for testing
+type folderK8sHandler interface {
+	getClient(ctx context.Context, orgID int64) (dynamic.ResourceInterface, bool)
+	getNamespace(orgID int64) string
+}
+
+var _ folderK8sHandler = (*foldk8sHandler)(nil)
+
+type foldk8sHandler struct {
+	cfg        *setting.Cfg
+	namespacer request.NamespaceMapper
+	gvr        schema.GroupVersionResource
 }
 
 func ProvideService(
@@ -66,9 +93,17 @@ func ProvideService(
 	db db.DB, // DB for the (new) nested folder store
 	features featuremgmt.FeatureToggles,
 	supportBundles supportbundles.Service,
+	cfg *setting.Cfg,
+	//	restConfigProvider apiserver.RestConfigProvider,
 	r prometheus.Registerer,
 	tracer tracing.Tracer,
 ) folder.Service {
+	k8sHandler := &foldk8sHandler{
+		gvr:        v0alpha1.FolderResourceInfo.GroupVersionResource(),
+		namespacer: request.GetNamespaceMapper(cfg),
+		cfg:        cfg,
+	}
+
 	srv := &Service{
 		log:                  slog.Default().With("logger", "folder-service"),
 		dashboardStore:       dashboardStore,
@@ -81,6 +116,7 @@ func ProvideService(
 		registry:             make(map[string]folder.RegistryService),
 		metrics:              newFoldersMetrics(r),
 		tracer:               tracer,
+		k8sclient:            k8sHandler,
 	}
 	srv.DBMigration(db)
 
@@ -138,6 +174,62 @@ func (s *Service) DBMigration(db db.DB) {
 }
 
 func (s *Service) GetFolders(ctx context.Context, q folder.GetFoldersQuery) ([]*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.GetFoldersFromApiServer(ctx, q)
+	}
+
+	return s.GetFoldersLegacy(ctx, q)
+}
+
+// NOTE: the current implementation is temporary and it will be
+// replaced by a proper indexing service/search API
+// Also, the current implementation does not support pagination
+func (s *Service) GetFoldersFromApiServer(ctx context.Context, q folder.GetFoldersQuery) ([]*folder.Folder, error) {
+	// create a new context - prevents issues when the request stems from the k8s api itself
+	// otherwise the context goes through the handlers twice and causes issues
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, q.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	out, err := client.List(newCtx, v1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// build map of uids
+	uidsSet := map[string]struct{}{}
+	for _, uid := range q.UIDs {
+		uidsSet[uid] = struct{}{}
+	}
+
+	hits := make([]*folder.Folder, 0)
+	for _, item := range out.Items {
+		// convert item to legacy folder format
+		f, _ := internalfolders.UnstructuredToLegacyFolder(item, q.SignedInUser.GetOrgID())
+		if f == nil {
+			return nil, fmt.Errorf("unable covert unstructured item to legacy folder")
+		}
+
+		_, ok := uidsSet[f.UID]
+		if len(uidsSet) > 0 && !ok {
+			continue
+		}
+
+		hits = append(hits, f)
+	}
+
+	return hits, nil
+}
+
+func (s *Service) GetFoldersLegacy(ctx context.Context, q folder.GetFoldersQuery) ([]*folder.Folder, error) {
 	if q.SignedInUser == nil {
 		return nil, folder.ErrBadRequest.Errorf("missing signed in user")
 	}
@@ -190,6 +282,53 @@ func (s *Service) GetFolders(ctx context.Context, q folder.GetFoldersQuery) ([]*
 }
 
 func (s *Service) Get(ctx context.Context, q *folder.GetFolderQuery) (*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.getFromApiServer(ctx, q)
+	}
+	return s.GetLegacy(ctx, q)
+}
+
+func (s *Service) getFromApiServer(ctx context.Context, q *folder.GetFolderQuery) (*folder.Folder, error) {
+	if q.SignedInUser == nil {
+		return nil, folder.ErrBadRequest.Errorf("missing signed in user")
+	}
+
+	if q.UID != nil && *q.UID == accesscontrol.GeneralFolderUID {
+		return folder.RootFolder, nil
+	}
+
+	if q.UID != nil && *q.UID == folder.SharedWithMeFolderUID {
+		return folder.SharedWithMeFolder.WithURL(), nil
+	}
+
+	// create a new context - prevents issues when the request stems from the k8s api itself
+	// otherwise the context goes through the handlers twice and causes issues
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, q.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	out, err := client.Get(newCtx, *q.UID, v1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	folder, _ := internalfolders.UnstructuredToLegacyFolder(*out, q.SignedInUser.GetOrgID())
+	if err != nil {
+		return nil, err
+	}
+
+	return folder, err
+}
+
+func (s *Service) GetLegacy(ctx context.Context, q *folder.GetFolderQuery) (*folder.Folder, error) {
 	if q.SignedInUser == nil {
 		return nil, folder.ErrBadRequest.Errorf("missing signed in user")
 	}
@@ -319,6 +458,57 @@ func (s *Service) setFullpath(ctx context.Context, f *folder.Folder, user identi
 }
 
 func (s *Service) GetChildren(ctx context.Context, q *folder.GetChildrenQuery) ([]*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.getChildrenFromApiServer(ctx, q)
+	}
+
+	return s.GetChildrenLegacy(ctx, q)
+}
+
+func (s *Service) getChildrenFromApiServer(ctx context.Context, q *folder.GetChildrenQuery) ([]*folder.Folder, error) {
+	// create a new context - prevents issues when the request stems from the k8s api itself
+	// otherwise the context goes through the handlers twice and causes issues
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, q.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	out, err := client.List(newCtx, v1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	hits := make([]*folder.Folder, 0)
+	for _, item := range out.Items {
+		// convert item to legacy folder format
+		f, _ := internalfolders.UnstructuredToLegacyFolder(item, q.SignedInUser.GetOrgID())
+		if f == nil {
+			return nil, fmt.Errorf("unable covert unstructured item to legacy folder")
+		}
+
+		// it we are at root level, skip subfolder
+		if q.UID == "" && f.ParentUID != "" {
+			continue // query filter
+		}
+		// if we are at a nested folder, then skip folders that don't belong to parentUid
+		if q.UID != "" && !strings.EqualFold(f.ParentUID, q.UID) {
+			continue
+		}
+
+		hits = append(hits, f)
+	}
+
+	return hits, nil
+}
+
+func (s *Service) GetChildrenLegacy(ctx context.Context, q *folder.GetChildrenQuery) ([]*folder.Folder, error) {
 	defer func(t time.Time) {
 		parent := q.UID
 		if q.UID != folder.SharedWithMeFolderUID {
@@ -565,6 +755,58 @@ func (s *Service) deduplicateAvailableFolders(ctx context.Context, folders []*fo
 }
 
 func (s *Service) GetParents(ctx context.Context, q folder.GetParentsQuery) ([]*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.getParentsFromApiServer(ctx, q)
+	}
+
+	return s.GetParentsLegacy(ctx, q)
+}
+
+func (s *Service) getParentsFromApiServer(ctx context.Context, q folder.GetParentsQuery) ([]*folder.Folder, error) {
+	if !s.features.IsEnabled(ctx, featuremgmt.FlagNestedFolders) || q.UID == accesscontrol.GeneralFolderUID {
+		return nil, nil
+	}
+	if q.UID == folder.SharedWithMeFolderUID {
+		return []*folder.Folder{&folder.SharedWithMeFolder}, nil
+	}
+
+	// create a new context - prevents issues when the request stems from the k8s api itself
+	// otherwise the context goes through the handlers twice and causes issues
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, q.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	hits := []*folder.Folder{}
+
+	parentUid := q.UID
+
+	for parentUid != "" {
+		out, err := client.Get(newCtx, parentUid, v1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		folder, _ := internalfolders.UnstructuredToLegacyFolder(*out, q.OrgID)
+		if err != nil {
+			return nil, err
+		}
+
+		parentUid = folder.ParentUID
+		hits = append(hits, folder)
+	}
+
+	return util.Reverse(hits[1:]), nil
+}
+
+func (s *Service) GetParentsLegacy(ctx context.Context, q folder.GetParentsQuery) ([]*folder.Folder, error) {
 	if !s.features.IsEnabled(ctx, featuremgmt.FlagNestedFolders) || q.UID == accesscontrol.GeneralFolderUID {
 		return nil, nil
 	}
@@ -591,6 +833,44 @@ func (s *Service) getFolderByTitle(ctx context.Context, orgID int64, title strin
 }
 
 func (s *Service) Create(ctx context.Context, cmd *folder.CreateFolderCommand) (*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.CreateOnApiServer(ctx, cmd)
+	}
+
+	return s.CreateLegacy(ctx, cmd)
+}
+
+func (s *Service) CreateOnApiServer(ctx context.Context, cmd *folder.CreateFolderCommand) (*folder.Folder, error) {
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, cmd.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	obj, err := internalfolders.LegacyCreateCommandToUnstructured(cmd)
+	if err != nil {
+		return nil, err
+	}
+	out, err := client.Create(newCtx, obj, v1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	folder, _ := internalfolders.UnstructuredToLegacyFolder(*out, cmd.SignedInUser.GetOrgID())
+	if err != nil {
+		return nil, err
+	}
+
+	return folder, err
+}
+
+func (s *Service) CreateLegacy(ctx context.Context, cmd *folder.CreateFolderCommand) (*folder.Folder, error) {
 	if cmd.SignedInUser == nil || cmd.SignedInUser.IsNil() {
 		return nil, folder.ErrBadRequest.Errorf("missing signed in user")
 	}
@@ -707,6 +987,50 @@ func (s *Service) Create(ctx context.Context, cmd *folder.CreateFolderCommand) (
 }
 
 func (s *Service) Update(ctx context.Context, cmd *folder.UpdateFolderCommand) (*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.UpdateOnApiServer(ctx, cmd)
+	}
+
+	return s.UpdateLegacy(ctx, cmd)
+}
+
+func (s *Service) UpdateOnApiServer(ctx context.Context, cmd *folder.UpdateFolderCommand) (*folder.Folder, error) {
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, cmd.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	obj, err := client.Get(ctx, cmd.UID, v1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := internalfolders.LegacyUpdateCommandToUnstructured(obj, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := client.Update(ctx, updated, v1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	folder, _ := internalfolders.UnstructuredToLegacyFolder(*out, cmd.SignedInUser.GetOrgID())
+	if err != nil {
+		return nil, err
+	}
+
+	return folder, err
+}
+
+func (s *Service) UpdateLegacy(ctx context.Context, cmd *folder.UpdateFolderCommand) (*folder.Folder, error) {
 	ctx, span := s.tracer.Start(ctx, "folder.Update")
 	defer span.End()
 
@@ -839,6 +1163,36 @@ func prepareForUpdate(dashFolder *dashboards.Dashboard, orgId int64, userId int6
 }
 
 func (s *Service) Delete(ctx context.Context, cmd *folder.DeleteFolderCommand) error {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.DeleteFromApiServer(ctx, cmd)
+	}
+
+	return s.DeleteLegacy(ctx, cmd)
+}
+
+func (s *Service) DeleteFromApiServer(ctx context.Context, cmd *folder.DeleteFolderCommand) error {
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, cmd.OrgID)
+	if !ok {
+		return nil
+	}
+
+	uid := cmd.UID
+	err = client.Delete(newCtx, uid, v1.DeleteOptions{})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Service) DeleteLegacy(ctx context.Context, cmd *folder.DeleteFolderCommand) error {
 	if cmd.SignedInUser == nil {
 		return folder.ErrBadRequest.Errorf("missing signed in user")
 	}
@@ -922,6 +1276,51 @@ func (s *Service) legacyDelete(ctx context.Context, cmd *folder.DeleteFolderComm
 }
 
 func (s *Service) Move(ctx context.Context, cmd *folder.MoveFolderCommand) (*folder.Folder, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.MoveOnApiServer(ctx, cmd)
+	}
+
+	return s.MoveLegacy(ctx, cmd)
+}
+
+func (s *Service) MoveOnApiServer(ctx context.Context, cmd *folder.MoveFolderCommand) (*folder.Folder, error) {
+	// --
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, cmd.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	obj, err := client.Get(newCtx, cmd.UID, v1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	obj, err = internalfolders.LegacyMoveCommandToUnstructured(obj, *cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := client.Update(newCtx, obj, v1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	folder, _ := internalfolders.UnstructuredToLegacyFolder(*out, cmd.SignedInUser.GetOrgID())
+	if err != nil {
+		return nil, err
+	}
+
+	return folder, err
+}
+
+func (s *Service) MoveLegacy(ctx context.Context, cmd *folder.MoveFolderCommand) (*folder.Folder, error) {
 	ctx, span := s.tracer.Start(ctx, "folder.Move")
 	defer span.End()
 
@@ -1142,6 +1541,64 @@ func (s *Service) nestedFolderDelete(ctx context.Context, cmd *folder.DeleteFold
 }
 
 func (s *Service) GetDescendantCounts(ctx context.Context, q *folder.GetDescendantCountsQuery) (folder.DescendantCounts, error) {
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) {
+		return s.GetDescendantCountsFromApiServer(ctx, q)
+	}
+	return s.GetDescendantCountsLegacy(ctx, q)
+}
+
+func (s *Service) GetDescendantCountsFromApiServer(ctx context.Context, q *folder.GetDescendantCountsQuery) (folder.DescendantCounts, error) {
+	// create a new context - prevents issues when the request stems from the k8s api itself
+	// otherwise the context goes through the handlers twice and causes issues
+	newCtx, cancel, err := s.getK8sContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if cancel != nil {
+		defer cancel()
+	}
+
+	client, ok := s.k8sclient.getClient(newCtx, q.OrgID)
+	if !ok {
+		return nil, nil
+	}
+
+	uid := q.UID
+
+	counts, err := client.Get(newCtx, *uid, v1.GetOptions{}, "counts")
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := toFolderLegacyCounts(counts)
+	if err != nil {
+		return nil, err
+	}
+
+	return *out, nil
+}
+
+func toFolderLegacyCounts(u *unstructured.Unstructured) (*folder.DescendantCounts, error) {
+	ds, err := v0alpha1.UnstructuredToDescendantCounts(u)
+	if err != nil {
+		return nil, err
+	}
+
+	var out = make(folder.DescendantCounts)
+	for _, v := range ds.Counts {
+		// if stats come from unified storage, we will use them
+		if v.Group != "sql-fallback" {
+			out[v.Resource] = v.Count
+			continue
+		}
+		// if stats are from single tenant DB and they are not in unified storage, we will use them
+		if _, ok := out[v.Resource]; !ok {
+			out[v.Resource] = v.Count
+		}
+	}
+	return &out, nil
+}
+
+func (s *Service) GetDescendantCountsLegacy(ctx context.Context, q *folder.GetDescendantCountsQuery) (folder.DescendantCounts, error) {
 	if q.SignedInUser == nil {
 		return nil, folder.ErrBadRequest.Errorf("missing signed-in user")
 	}
@@ -1442,4 +1899,66 @@ func (s *Service) supportItemFromFolders(folders []*folder.Folder) (*supportbund
 		Filename:  "folders.json",
 		FileBytes: b,
 	}, nil
+}
+
+// -----------------------------------------------------------------------------------------
+// Folder k8s functions
+// -----------------------------------------------------------------------------------------
+
+func (fk8s *foldk8sHandler) getClient(ctx context.Context, orgID int64) (dynamic.ResourceInterface, bool) {
+	cfg := &rest.Config{
+		Host:    fk8s.cfg.AppURL,
+		APIPath: "/apis",
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure: true, // Skip TLS verification
+		},
+		Username: fk8s.cfg.AdminUser,
+		Password: fk8s.cfg.AdminPassword,
+	}
+
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, false
+	}
+	return dyn.Resource(fk8s.gvr).Namespace(fk8s.getNamespace(orgID)), true
+}
+
+func (fk8s *foldk8sHandler) getNamespace(orgID int64) string {
+	return fk8s.namespacer(orgID)
+}
+
+func (s *Service) getK8sContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	requester, requesterErr := identity.GetRequester(ctx)
+	if requesterErr != nil {
+		return nil, nil, requesterErr
+	}
+
+	user, exists := k8sRequest.UserFrom(ctx)
+	if !exists {
+		// add in k8s user if not there yet
+		var ok bool
+		user, ok = requester.(k8sUser.Info)
+		if !ok {
+			return nil, nil, fmt.Errorf("could not convert user to k8s user")
+		}
+	}
+
+	newCtx := k8sRequest.WithUser(context.Background(), user)
+	newCtx = log.WithContextualAttributes(newCtx, log.FromContext(ctx))
+	// TODO: after GLSA token workflow is removed, make this return early
+	// and move the else below to be unconditional
+	if requesterErr == nil {
+		newCtxWithRequester := identity.WithRequester(newCtx, requester)
+		newCtx = newCtxWithRequester
+	}
+
+	// inherit the deadline from the original context, if it exists
+	deadline, ok := ctx.Deadline()
+	if ok {
+		var newCancel context.CancelFunc
+		newCtx, newCancel = context.WithTimeout(newCtx, time.Until(deadline))
+		return newCtx, newCancel, nil
+	}
+
+	return newCtx, nil, nil
 }
